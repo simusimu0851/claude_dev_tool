@@ -1,0 +1,7 @@
+{
+  "cheap_model": "claude-haiku-4-5-20251001",
+  "advisor_model": "claude-opus-4-6",
+  "project_path": ".",
+  "output_path": "/Users/sinjun/01_ai_projects/02_automation/edit_auto/processed",
+  "rag_server_url": "http://127.0.0.1:8097"
+}
