@@ -315,14 +315,4 @@ RAG_SERVER_URL=http://127.0.0.1:8097
 - **캐시 최적화**: PROJECT.md 자주 갱신 금지 (캐시 breakpoint 유지)
 - **비용 모니터링**: `status` 명령어로 토큰 사용량 확인 → 필요시 세션 재시작
 
-## 📄 라이센스
 
-MIT
-
-## 🤝 기여
-
-이슈 및 PR 환영합니다!
-
----
-
-**Made with ❤️ for AI-assisted development**
