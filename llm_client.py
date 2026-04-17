@@ -14,6 +14,9 @@ DEFAULT_MODELS = {
     "standard": "claude-sonnet-4-6",
 }
 
+# tool_use 재호출 상한 — LLM이 도구 결과 기반 최종 응답 없이 계속 도구만 부를 때 비용 폭발 방지
+_MAX_TOOL_LOOPS = 5
+
 
 def _make_cached_system(text: str) -> list[dict]:
     """system 문자열을 cache_control 포함 리스트로 변환."""
@@ -84,7 +87,9 @@ class LLMClient:
         # messages를 복사해서 tool_use 루프에서 안전하게 확장
         loop_messages = [m for m in messages]
 
+        loop_count = 0
         while True:
+            loop_count += 1
             kwargs = dict(
                 model=model,
                 max_tokens=max_tokens,
@@ -117,6 +122,14 @@ class LLMClient:
             if not tool_uses:
                 break  # 텍스트만 반환 → 루프 종료
 
+            # 무한 호출 방지: 상한 도달 시 도구 실행을 멈추고 현재까지 응답 반환
+            if loop_count >= _MAX_TOOL_LOOPS:
+                print(
+                    f"\n  ⚠️  tool_use 루프 상한 {_MAX_TOOL_LOOPS}회 도달 — 도구 실행 중단",
+                    flush=True,
+                )
+                break
+
             # tool_use 실행: MCP 서버 호출
             # assistant 응답 전체를 대화에 추가 (API 규약)
             loop_messages.append({"role": "assistant", "content": _content_to_dicts(final.content)})
@@ -124,10 +137,15 @@ class LLMClient:
             tool_results = []
             for tu in tool_uses:
                 print(f"\n  🔍 [{tu.name}] \"{tu.input.get('query', '')}\"", flush=True)
-                result_text = self.rag.call_tool(tu.name, tu.input)
-                # 결과 길이 표시
-                chunk_lines = result_text.count("\n") + 1
-                print(f"  📄 {chunk_lines}줄 반환", flush=True)
+                # RAG 서버 오류가 루프 전체를 죽이지 않도록 보호
+                try:
+                    result_text = self.rag.call_tool(tu.name, tu.input)
+                except Exception as e:
+                    result_text = f"[도구 호출 실패: {e}]"
+                    print(f"  ⚠️  {result_text}", flush=True)
+                else:
+                    chunk_lines = result_text.count("\n") + 1
+                    print(f"  📄 {chunk_lines}줄 반환", flush=True)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tu.id,
@@ -222,10 +240,21 @@ class LLMClient:
 
 
 def _content_to_dicts(content_blocks) -> list[dict]:
-    """Anthropic SDK의 content block 객체를 JSON-serializable dict로 변환."""
+    """
+    Anthropic SDK의 content block 객체를 JSON-serializable dict로 변환.
+    Pydantic model_dump로 모든 block type (text·tool_use·server_tool_use·thinking 등)을
+    있는 그대로 보존 → advisor beta 같은 서버사이드 블록 누락 방지.
+
+    cache_control은 요청 전용 필드이므로 assistant 응답을 다시 넣을 때 제거:
+    남겨두면 의도치 않은 위치에 cache breakpoint가 생겨 PROJECT.md·system 캐시를 무효화할 수 있음.
+    """
     result = []
     for b in content_blocks:
-        if b.type == "text":
+        if hasattr(b, "model_dump"):
+            d = b.model_dump(exclude_none=True, mode="json")
+            d.pop("cache_control", None)
+            result.append(d)
+        elif b.type == "text":
             result.append({"type": "text", "text": b.text})
         elif b.type == "tool_use":
             result.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})

@@ -20,6 +20,7 @@ README와의 일관성 — 유지되는 토큰 절약 전략:
 7. RAG 자동 통합 유지 (외부 정보가 필요한 단계에서만 활성화)
 """
 import re
+import sys
 from pathlib import Path
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
@@ -213,7 +214,9 @@ class PipelineController:
             system=self.system_prompt,
             max_tokens=_TOKENS_PLAN,
             use_advisor=True,
-            use_rag=False,  # 계획은 설계 판단 → RAG 도구 정의 토큰 절약
+            # 전 단계에서 동일 tools → tools/system/PROJECT.md 캐시 prefix 재사용
+            # (tools 정의 토큰 < 캐시 재생성 비용이므로 통일이 이득)
+            use_rag=True,
             print_prefix="\n📋 계획:\n",
         )
         used = self.llm.get_total_tokens() - tokens_before
@@ -240,14 +243,15 @@ class PipelineController:
         if action == "n":
             return None, pipeline_messages
         if action == "s":
-            print("│  ↳ 실행은 스킵 불가 — 취소하려면 n 선택")
-            return None, pipeline_messages
+            # 실행 단계는 스킵 개념이 없음 → y와 동일하게 진행 (UX 일관성)
+            print("│  ↳ 실행은 스킵 개념이 없어 그대로 진행합니다")
 
+        # user_input은 이미 plan_prompt에 포함되어 pipeline_messages에 있음 → 중복 생략
         exec_prompt = (
-            f"위 계획에 따라 코드를 구현하세요.\n"
-            f"복잡한 알고리즘·설계 결정은 advisor 도구로 Opus에 위임하세요.\n"
-            f"기존 파일 수정은 ```diff 형식, 새 파일 생성은 전체 코드 블록으로 출력합니다.\n\n"
-            f"[원 요청]\n{user_input}"
+            "위 계획에 따라 코드를 구현하세요.\n"
+            "복잡한 알고리즘·설계 결정은 advisor 도구로 Opus에 위임하세요.\n"
+            "기존 파일 수정과 새 파일 생성 모두 ```diff 형식으로 출력합니다.\n"
+            "새 파일은 `--- /dev/null` + `+++ b/경로` 헤더를 사용하세요."
         )
         pipeline_messages.append({"role": "user", "content": exec_prompt})
 
@@ -309,7 +313,7 @@ class PipelineController:
             system=self.system_prompt,
             max_tokens=_TOKENS_REVIEW,
             use_advisor=True,
-            use_rag=False,
+            use_rag=True,  # 전 단계와 tools 통일 → 캐시 prefix 유지
             print_prefix="\n🔍 리뷰:\n",
         )
         used = self.llm.get_total_tokens() - tokens_before
@@ -365,7 +369,7 @@ class PipelineController:
             system=self.system_prompt,
             max_tokens=_TOKENS_REVISE,
             use_advisor=True,
-            use_rag=False,
+            use_rag=True,  # 전 단계와 tools 통일 → 캐시 prefix 유지
             print_prefix="\n🔧 수정:\n",
         )
         used = self.llm.get_total_tokens() - tokens_before
@@ -381,6 +385,12 @@ class PipelineController:
     def _confirm(self, action: str) -> str:
         """Returns: 'y'(계속), 'n'(취소), 's'(스킵)"""
         try:
+            # LLM 스트리밍 중 실수로 입력된 키가 버퍼에 남아 다음 확인을 자동 통과하는 현상 방지
+            try:
+                import termios
+                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            except Exception:
+                pass
             ans = input(f"│\n│  ▶ {action}할까요? [Enter/y=예  n=취소  s=스킵] > ").strip().lower()
         except EOFError:
             return "n"
@@ -434,11 +444,13 @@ class PipelineController:
         """
         단순 질문(설명/개념) → 파이프라인 스킵.
         SHORT 키워드가 있고 CODE 키워드가 없으면 질문으로 분류.
+
+        한국어는 조사·어미가 붙어 단어 단위 비교가 실패하므로 부분 문자열 매칭 사용
+        (예: "구현해줘"에서 "구현"을 감지).
         """
         lower = user_input.lower()
-        words = set(re.split(r"[\s,]+", lower))
-        has_short = bool(words & _SHORT_KEYWORDS)
-        has_code = bool(words & _CODE_KEYWORDS)
+        has_short = any(kw in lower for kw in _SHORT_KEYWORDS)
+        has_code = any(kw in lower for kw in _CODE_KEYWORDS)
         if has_short and not has_code:
             return True
         # 키워드가 전혀 없으면 짧은 입력(50자 미만)은 질문으로, 그 외는 파이프라인
@@ -448,10 +460,9 @@ class PipelineController:
 
     def _estimate_max_tokens(self, user_input: str) -> int:
         lower = user_input.lower()
-        words = set(re.split(r"[\s,]+", lower))
-        if words & _CODE_KEYWORDS:
+        if any(kw in lower for kw in _CODE_KEYWORDS):
             return _TOKENS_CODE
-        if words & _SHORT_KEYWORDS:
+        if any(kw in lower for kw in _SHORT_KEYWORDS):
             return _TOKENS_SHORT
         return _TOKENS_MID
 
@@ -464,8 +475,11 @@ class PipelineController:
         recent_text = "\n".join(
             f"{m['role'].upper()}: {m['content'][:600]}" for m in recent
         )
-        if self.memory.summary_memory:
-            recent_text = f"[이전 대화 요약]\n{self.memory.summary_memory}\n\n[최근 대화]\n{recent_text}"
+        # summary 전체(최대 8 chunk × ~2k tokens)를 넣으면 "80% 절감" 주석과 모순
+        # 가장 최근 chunk 1개만 포함 (오래된 맥락은 SESSION_STATE 목적상 불필요)
+        if self.memory.summary_chunks:
+            latest = self.memory.summary_chunks[-1]
+            recent_text = f"[직전 대화 요약]\n{latest}\n\n[최근 대화]\n{recent_text}"
 
         timestamp = session_info.get("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
@@ -570,7 +584,7 @@ class PipelineController:
     # ------------------------------------------------------------------
 
     def _extract_and_apply_diffs(self, response: str) -> None:
-        diff_blocks = re.findall(r"```diff\n(.*?)```", response, re.DOTALL)
+        diff_blocks = re.findall(r"```diff[^\n]*\n(.*?)```", response, re.DOTALL)
         if not diff_blocks:
             return
         print("\n🔧 diff 블록 감지 — 파일에 적용 중...")

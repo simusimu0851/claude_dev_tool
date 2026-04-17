@@ -153,6 +153,8 @@ class DevSession:
 
             self.request_count += 1
             self._soft_exit_warned = False
+            # 이전 요청에서 Ctrl+C 한 번이 눌려 force_exit 핸들러로 바뀌었을 수 있음 → 복구
+            signal.signal(signal.SIGINT, self._on_interrupt)
             self.controller.process_request(user_input)
 
         self.is_active = False

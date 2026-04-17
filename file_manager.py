@@ -62,6 +62,7 @@ class FileManager:
 
     def save_file(self, filename: str, content: str) -> Path:
         path = self.output_dir / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         self.generated_files.append(str(path))
         print(f"💾 저장됨: {path}")
@@ -96,6 +97,19 @@ class FileManager:
 
             file_path = base / rel_path
             if not file_path.exists():
+                # 새 파일의 명확한 신호: --- /dev/null OR hunk 헤더 @@ -0,0
+                # (--- a/path 패턴은 경로 오타와 구분 불가 → 사용 안 함)
+                is_new_file = bool(
+                    re.search(r"^--- /dev/null", section, re.MULTILINE)
+                    or re.search(r"^@@ -0,0", section, re.MULTILINE)
+                )
+                if is_new_file:
+                    new_content = self._extract_new_file_content(section)
+                    file_path.parent.mkdir(parents=True, exist_ok=True)
+                    file_path.write_text(new_content, encoding="utf-8")
+                    modified.append(rel_path)
+                    print(f"  ✅ 새 파일 생성됨: {rel_path}")
+                    continue
                 alt = self.output_dir / rel_path
                 if alt.exists():
                     file_path = alt
@@ -106,9 +120,10 @@ class FileManager:
             try:
                 original = file_path.read_text(encoding="utf-8").splitlines(keepends=True)
                 patched = self._apply_hunks(original, section)
-                # 백업 후 적용 (토큰 비용 0, 안정성 확보)
+                # 백업 후 적용 — 이미 .bak이 있으면 최초 원본이 보존되도록 덮어쓰지 않음
                 backup_path = file_path.with_suffix(file_path.suffix + ".bak")
-                shutil.copy2(file_path, backup_path)
+                if not backup_path.exists():
+                    shutil.copy2(file_path, backup_path)
                 file_path.write_text("".join(patched), encoding="utf-8")
                 modified.append(rel_path)
                 print(f"  ✅ 패치 적용됨: {rel_path}  (백업: {backup_path.name})")
@@ -127,9 +142,10 @@ class FileManager:
         result = list(lines)
         offset = 0
 
+        # hunk body는 [+\- \\]로 시작하거나, LLM이 공백을 strip한 bare \n (빈 컨텍스트 줄)도 허용
         hunk_re = re.compile(
             r"@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@[^\n]*\n"
-            r"((?:[+\- \\][^\n]*(?:\n|$))*)",
+            r"((?:[+\- \\][^\n]*\n|\n)*)",
             re.MULTILINE,
         )
 
@@ -143,14 +159,20 @@ class FileManager:
             for line in hunk_body.splitlines(keepends=True):
                 if not line:
                     continue
+                # trailing space가 strip된 빈 컨텍스트 줄 (bare \n) → 양쪽에 empty line 유지
+                if line == "\n":
+                    old_block.append("\n")
+                    new_block.append("\n")
+                    continue
                 marker, content = line[0], line[1:]
                 if marker == "-":
                     old_block.append(content)
                 elif marker == "+":
                     new_block.append(content)
-                elif marker in (" ", "\t"):
+                elif marker == " ":
                     old_block.append(content)
                     new_block.append(content)
+                # '\' 마커 (No newline at end of file)는 무시
 
             start = orig_start + offset
             end = start + len(old_block)
@@ -158,6 +180,27 @@ class FileManager:
             offset += len(new_block) - len(old_block)
 
         return result
+
+    def _extract_new_file_content(self, diff_section: str) -> str:
+        """새 파일 diff에서 실제 파일 내용(+ 줄)을 추출."""
+        lines = []
+        in_hunk = False
+        for line in diff_section.splitlines(keepends=True):
+            if line.startswith("@@"):
+                in_hunk = True
+                continue
+            if not in_hunk:
+                continue
+            if not line:
+                continue
+            # '\ No newline at end of file' 같은 메타 마커 무시
+            if line[0] == "\\":
+                continue
+            if line[0] == "+":
+                lines.append(line[1:])
+            elif line[0] == " ":
+                lines.append(line[1:])
+        return "".join(lines)
 
     # ------------------------------------------------------------------
     # 선택적 컨텍스트 로딩
