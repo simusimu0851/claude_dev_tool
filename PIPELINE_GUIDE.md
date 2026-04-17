@@ -38,8 +38,89 @@ python3 dev_pipeline_v4.py --engine unity --path /path/to/project
 
 시작 시 자동으로:
 1. `pipeline_config.json` 로드 (있으면)
-2. `dev_output/PROJECT.md` 로드 → 프로젝트 캐시 블록 구성
-3. `dev_output/SESSION_STATE.md` 로드 → 이전 작업 맥락 복원
+2. `<작업폴더>/PROJECT.md` 로드 → 프로젝트 캐시 블록 구성
+3. `<작업폴더>/SESSION_STATE.md` 로드 → 이전 작업 맥락 복원
+
+> 기본 작업 폴더는 `--path`로 지정한 폴더 (미지정 시 현재 디렉토리).
+> 메타 파일을 분리하고 싶으면 `--save-path` 지정.
+
+### 2.1.b 개발 파이프라인 — 계획 → 실행 → [리뷰 ↔ 수정 루프]
+
+사용자가 코드 키워드(구현/만들/수정/버그/fix 등)를 포함한 요청을 하면 **파이프라인**으로 처리됩니다.
+단순 질문(설명/왜/what 등)은 파이프라인 없이 바로 응답합니다.
+
+리뷰/수정은 **루프 구조**로 동작하며 (`_MAX_REVIEW_LOOPS=3`):
+- 리뷰는 단순 PASS/FAIL이 아닌 **설계 브리핑**을 생성 → 수정이 그 설계도를 그대로 반영
+- `REVIEW_PASS` / 사용자 `n·s` / 최대 루프 도달 시 루프 종료
+
+```
+You > PlayerController에 이동 기능 구현해줘
+
+─────────────────────────────────────────────────
+🔄 개발 파이프라인 시작  (Advisor=Opus, Main=Haiku)
+   [1]계획 → [2]실행 → [리뷰 ↔ 수정 루프, 최대 3회]
+   리뷰는 설계 브리핑 형식 → 수정은 그 설계도를 그대로 반영
+─────────────────────────────────────────────────
+
+┌─ [1/4] 계획 수립
+│  · Advisor(Opus) 활성화 — Haiku가 필요시에만 Opus에 추론 위임
+│  · 수정/생성 파일, 구현 순서, 예상 리스크 분석
+│  ▶ 계획 수립을 실행할까요? [Enter/y n s] > y
+📋 계획:
+- Assets/Scripts/PlayerController.cs 수정
+- Rigidbody2D 기반 이동 로직 추가
+└─ [계획 수립 완료] Advisor(Opus) 활성 | 토큰: 840
+
+┌─ [2/4] 실행
+│  ▶ 실행할까요? [Enter/y n s] > y
+🤖 구현:
+```diff
+--- a/Assets/Scripts/PlayerController.cs
++++ b/Assets/Scripts/PlayerController.cs
+@@ ...
+```
+└─ [실행 완료] Advisor(Opus) 활성 | 토큰: 2,140
+
+┌─ [3/4 리뷰 (설계 브리핑)]
+│  · 사용자 의도 정합성 / 개선 필요 / 보완할 점
+│  · 결론: REVIEW_PASS 또는 REVIEW_FAIL
+│  ▶ 리뷰를 실행할까요? [Enter/y n s] > y
+🔍 리뷰:
+# 리뷰 브리핑
+## 사용자 의도와의 정합성
+- 이동 구현 충족, 속도 상수는 인스펙터 노출 누락
+## 개선 필요 항목 (우선순위 순)
+- [P1] PlayerController.cs:Move — moveSpeed를 [SerializeField]로 노출
+- [P2] PlayerController.cs:Update — Input.GetAxisRaw로 변경
+## 보완할 점
+- FixedUpdate 사용 여부 검토
+## 결론
+REVIEW_FAIL
+└─ [리뷰(1/3) 완료] ⚠️ 수정 필요 (REVIEW_FAIL) | 토큰: 720
+
+┌─ [4/4 수정 (브리핑 기반)]
+│  · 설계도 역할의 리뷰 브리핑을 근거로 Haiku 중심 수정
+│  · 명확한 항목은 Haiku, 정말 애매한 부분만 advisor
+│  ▶ 수정을 실행할까요? [Enter/y n s] > y
+🔧 수정: (P1, P2 해결 diff만 출력)
+└─ [수정(1/3) 완료] Advisor(Opus) 활성 | 토큰: 560
+
+┌─ [리뷰 루프 2/3]
+│  ▶ 리뷰를 실행할까요? [Enter/y n s] > y
+🔍 ## 결론 REVIEW_PASS
+└─ [리뷰(2/3) 완료] ✅ 통과 | 토큰: 340
+
+✅ 파이프라인 완료
+```
+
+**핵심 설계**:
+- **리뷰 = 설계 브리핑**: 수정 단계가 "무엇을 어떻게 고칠지"를 파싱·추론할 필요 없이 우선순위 항목을 그대로 반영. Haiku만으로도 품질 높은 수정 가능 → advisor 호출률 하락
+- **advisor 도구** (토큰 절약): Opus를 매 단계마다 통째로 쓰는 게 아니라, Haiku가 복잡한 추론이 필요할 때만 advisor 도구로 위임. 단순한 구현·수정은 Haiku 선에서 종결
+- **루프 비용 상한**: `_MAX_REVIEW_LOOPS=3`으로 무한 반복 방지. 3회 도달 시 현재 구현 확정
+- **prefix caching**: 단계·루프 간 동일 prefix(이전 메시지)는 Anthropic이 자동 캐시 → 루프가 길어져도 입력 토큰 완만 증가
+- **중간 결과 비저장**: 모든 루프 내부 prompt/응답은 pipeline 내부에만 누적되고, memory에는 최종 assistant 응답만 저장 → 다음 요청 컨텍스트 깔끔
+- **각 단계/루프 스킵·중단 가능**: `n`=취소(현재 구현 확정), `s`=스킵 — 리뷰/수정 루프도 매 반복마다 다시 물음
+- **RAG는 실행 단계에만 활성**: 계획/리뷰/수정은 `use_rag=False`로 도구 스키마 토큰 절약
 
 ### 2.2 일반 개발 루프
 
@@ -258,16 +339,20 @@ project update는 캐시 미스를 유발하므로 아키텍처가 실제로 바
 ## 6. 파일 구조
 
 ```
-프로젝트/
+파이프라인 코드/
 ├── dev_pipeline_v4.py      진입점, CLI 루프, 세션 관리
 ├── llm_client.py           API 호출, 캐시 통계, 비용 추적
 ├── memory_manager.py       5계층 메모리, 압축, 파일 컨텍스트 축약
-├── pipeline_controller.py  요청 처리, 상태 생성, diff 적용 트리거
+├── pipeline_controller.py  파이프라인 (계획→실행→리뷰↔수정 루프), 상태 생성, diff 적용 트리거
 ├── file_manager.py         파일 I/O, diff 패치 (백업 포함), 섹션 추출
 ├── pipeline_config.json    설정 (모델, 경로, 엔진)
-├── prompts/
-│   └── system.md           시스템 프롬프트 (diff 형식 강제 포함)
-└── dev_output/
-    ├── PROJECT.md           프로젝트 고정 컨텍스트 (캐시 대상)
-    └── SESSION_STATE.md     세션 상태 (세션마다 갱신)
+└── prompts/
+    └── system.md           시스템 프롬프트 (diff + advisor 지침 포함)
+
+작업 폴더 (--path로 지정, 기본 = 현재 디렉토리)/
+├── (소스 코드)
+├── PROJECT.md              프로젝트 고정 컨텍스트 (캐시 대상)
+├── SESSION_STATE.md        세션 상태 (세션마다 갱신)
+├── .input_history          입력 히스토리
+└── *.bak                   diff 적용 전 자동 백업
 ```

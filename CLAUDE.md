@@ -75,18 +75,32 @@ API 메시지 주입 순서: `[PROJECT.md + cache]` → `[SESSION_STATE.md + cac
 - **선택적 파일 로딩** (`read_relevant_section`): 150줄 미만이면 전체, 이상이면 검색어 관련 섹션만 (context 25줄)
 - **프로젝트 검색** (`search_project`): grep 기반 키워드 검색 (최대 30건, 바이너리·빌드 폴더 제외)
 - 프로젝트 구조 분석 (깊이 3, 최대 60항목의 트리 뷰)
-- 모든 출력은 `output_path`로 저장
+- 모든 출력은 `output_dir` (기본 = `project_path`, `--save-path` 지정 시 해당 폴더)로 저장
 
 ### 5. **pipeline_controller.py** (요청 오케스트레이션)
-- **요청 처리 흐름**: 사용자 입력 → 메모리 추가 → 필요 시 압축 → max_tokens 동적 추정 → 스트리밍 응답 (RAG 자동 활성화) → diff 자동 감지·적용 → 메모리에 응답 추가
-- **동적 max_tokens 추정** (`_estimate_max_tokens`):
-  - 코드 키워드 (구현, 만들, 버그, fix 등) → 4096 토큰
-  - 단순 질문 키워드 (설명, 왜, what 등) → 800 토큰
-  - 기본 → 2048 토큰
-- **diff 자동 적용** (`_extract_and_apply_diffs`): 응답에서 ````diff` 블록을 감지하여 FileManager로 자동 패치
+- **요청 분기**:
+  - `_is_simple_question` → 단순 질문 (설명/왜/what) → `_run_direct`로 파이프라인 스킵
+  - 코드 요청 → `_run_pipeline`로 4단계 파이프라인 진입
+- **파이프라인 흐름** (`_run_pipeline`): `계획 → 실행 → [리뷰 ↔ 수정 루프, 최대 _MAX_REVIEW_LOOPS회]`
+  1. **Stage 1: 계획** (`_stage_plan`) — 수정/생성 파일, 구현 순서, 리스크 분석. 코드 작성 없음. `use_advisor=True, use_rag=False` (설계 판단 → RAG 도구 정의 토큰 절약)
+  2. **Stage 2: 실행** (`_stage_execute`) — 계획 기반 구현, diff 출력. `use_advisor=True, use_rag=True`, 완료 후 `_extract_and_apply_diffs` 즉시 적용
+  3. **Stage 3-4: 리뷰-수정 루프** — `_MAX_REVIEW_LOOPS=3` 상한. 매 루프에서:
+     - **`_stage_review`** — Opus advisor로 **설계 브리핑** 생성. 출력 포맷: `# 리뷰 브리핑 / ## 사용자 의도와의 정합성 / ## 개선 필요 항목 (P1, P2…) / ## 보완할 점 / ## 결론 REVIEW_PASS|REVIEW_FAIL`. `use_advisor=True, use_rag=False`
+     - **`_stage_revise`** — 리뷰 브리핑을 **설계도**로 삼아 수정. "명확한 항목은 Haiku에서 직접 처리, 판단이 정말 애매한 부분에서만 advisor 호출" 프롬프트로 Haiku 중심 유도. 수정분만 diff. `use_advisor=True, use_rag=False`
+     - **루프 종료 조건**: `REVIEW_PASS` / 사용자 `n·s` / `_MAX_REVIEW_LOOPS` 도달
+     - 매 루프 끝에 `current_impl ← revised`로 갱신 → 다음 리뷰는 수정분 대상으로 재평가
+- **각 단계 사용자 확인** (`_confirm`): `y/Enter`=진행, `n`=취소, `s`=스킵. 리뷰/수정 루프는 매 반복마다 다시 물음
+- **단계별 브리핑**: 헤더(무슨 일이 일어나는지) + 풋터(advisor 활성 여부 + 이번 단계 토큰 + 루프 인덱스)
+- **pipeline_messages**: 파이프라인 내부 누적 메시지 리스트. 루프 내 리뷰·수정 응답도 여기 append → 다음 루프 리뷰가 수정본을 전제로 검토 가능. prefix caching으로 앞부분 캐시 재사용. memory에는 최종 assistant만 저장하여 다음 요청 컨텍스트 깔끔 유지
+- **advisor 도구 전략** (토큰 절약의 핵심): Haiku가 메인, `use_advisor=True`면 Opus advisor 도구가 제공됨 → Haiku가 복잡한 추론이 필요할 때만 advisor 호출. 특히 수정 단계는 리뷰 브리핑이 설계도 역할을 하므로 Haiku만으로 처리되는 비율이 높음 (advisor 호출률 추가 하락)
+- **동적 max_tokens** (단계별 상수 + `_estimate_max_tokens`):
+  - `_TOKENS_PLAN=1500` / `_TOKENS_EXEC=4096` / `_TOKENS_REVIEW=1500` (설계 브리핑 포맷 수용) / `_TOKENS_REVISE=4096`
+  - 직접 응답: 코드 키워드 4096, 질문 800, 기타 2048
+- **루프 비용 상한**: `_MAX_REVIEW_LOOPS=3`. 3회 도달 시 현재 구현 확정. 비용 폭주 방지
+- **diff 자동 적용** (`_extract_and_apply_diffs`): 실행 + 매 수정 루프 완료 직후 호출하여 ````diff` 블록을 FileManager로 패치
 - SESSION_STATE.md 생성: 최근 10개 메시지 + 요약만 사용 (입력 토큰 ~80% 절감), compact 불릿 포맷
 - PROJECT.md 생성: 프로젝트 구조 + 최근 20개 메시지 + 세션 상태 분석
-- `prompts/system.md`에서 시스템 프롬프트 로드
+- `prompts/system.md`에서 시스템 프롬프트 로드 (advisor 도구 사용 지침 포함)
 
 ### 6. **rag_client.py** (RAG/MCP 지식 검색)
 - MCP SSE 서버에 연결하여 외부 지식 검색 전담
@@ -133,7 +147,6 @@ python dev_pipeline_v4.py --engine unity --path /my/project --save-path ./output
   "advisor_model": "claude-opus-4-6",
   "engine": "unity",
   "project_path": ".",
-  "output_path": "./game_dev_output",
   "rag_server_url": "http://127.0.0.1:8097"
 }
 ```
@@ -145,9 +158,14 @@ python dev_pipeline_v4.py --engine unity --path /my/project --save-path ./output
     "advisor_model": "claude-opus-4-6",
     "engine": "python",
     "project_path": ".",
-    "output_path": "./dev_output",
+    "output_path": None,  # None이면 project_path와 동일
 }
 ```
+
+**경로 규칙** (v4 변경):
+- `--path` (`project_path`): 작업 폴더. 소스 코드 검색/diff 적용 대상 + `PROJECT.md`·`SESSION_STATE.md`도 여기서 읽고 씀 (기본).
+- `--save-path` (`output_path`): 메타 파일을 별도 폴더에 분리하고 싶을 때만 지정. 미지정 시 `project_path` 그대로 사용.
+- `.bak` 백업·diff 패치는 항상 `project_path` 기준 (분리 시에도 동일).
 
 설정 우선순위: `DEFAULT_CONFIG` → `pipeline_config.json` 덮어쓰기 → CLI 인자 덮어쓰기
 
@@ -164,7 +182,7 @@ python dev_pipeline_v4.py --engine unity --path /my/project --save-path ./output
 - 마지막 작업, 진행 중 항목, TODO, 주의사항만 — compact 불릿 포맷
 - 최근 10개 메시지만 사용하여 생성 (전체 대화 대비 입력 토큰 ~80% 절감)
 - 세션 내에서 불변이므로 2번째 API 호출부터 캐시 히트
-- 저장 위치: `output_path` 디렉토리 내
+- 저장 위치: 기본은 `project_path` (작업 폴더). `--save-path` 지정 시 해당 폴더
 
 ### 2단계 검색 워크플로우
 1. `find <키워드>` → 프로젝트 전체에서 파일별 그룹핑된 검색 결과 (토큰 비용 0)
@@ -240,8 +258,11 @@ LLM 클라이언트는 모델 등급별 입출력 토큰을 추적합니다. 확
 
 ## 출력 파일
 
-세션 중 생성되는 모든 파일은 `output_path`로 이동됩니다:
+기본: `output_path`가 `project_path`와 동일 — 모두 작업 폴더에 저장됨:
 - `SESSION_STATE.md`: 다음 세션을 위한 영구 상태 (저장 시 자동 생성)
 - `PROJECT.md`: 프로젝트 고정 컨텍스트 (project update 시 생성)
+- `.input_history`: prompt_toolkit 입력 히스토리
 - 사용자 요청으로 생성된 파일들 (`FileManager.save_file()`을 통해 저장)
 - `.bak` 파일: diff 적용 전 자동 백업 (프로젝트 디렉토리 내)
+
+`--save-path`로 분리 시: 위 메타 파일들은 별도 폴더로, `.bak` 백업과 diff 패치는 여전히 `project_path`에 적용됨.

@@ -109,8 +109,11 @@ class LLMClient:
                     cache_read += getattr(final.usage, "cache_read_input_tokens", 0) or 0
                     cache_creation += getattr(final.usage, "cache_creation_input_tokens", 0) or 0
 
-            # tool_use 블록 확인
-            tool_uses = [b for b in final.content if b.type == "tool_use"]
+            # tool_use 블록 확인 (advisor는 서버 측 자동 처리 → client 루프 제외)
+            tool_uses = [
+                b for b in final.content
+                if b.type == "tool_use" and b.name != "advisor"
+            ]
             if not tool_uses:
                 break  # 텍스트만 반환 → 루프 종료
 

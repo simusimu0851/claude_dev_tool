@@ -43,7 +43,9 @@ DEFAULT_CONFIG = {
     "advisor_model": "claude-opus-4-6",
     "engine": "python",
     "project_path": ".",
-    "output_path": "./dev_output",
+    # output_path 미지정 시 project_path와 동일 (작업 폴더 = 출력 폴더)
+    # 분리가 필요하면 --save-path 또는 pipeline_config.json으로 override
+    "output_path": None,
 }
 
 
@@ -60,9 +62,11 @@ class DevSession:
 
         self.llm = LLMClient(config)
         self.memory = MemoryManager()
+        project_path = config.get("project_path", ".")
+        output_path = config.get("output_path") or project_path
         self.files = FileManager(
-            output_path=config.get("output_path", "./dev_output"),
-            project_path=config.get("project_path", "."),
+            output_path=output_path,
+            project_path=project_path,
         )
         self.controller = PipelineController(self.llm, self.memory, self.files, config)
 
@@ -96,7 +100,7 @@ class DevSession:
 
     def _run_loop(self) -> None:
         if _PT_AVAILABLE:
-            history_path = Path(self.config.get("output_path", "./dev_output")) / ".input_history"
+            history_path = Path(self.files.output_dir) / ".input_history"
             history_path.parent.mkdir(parents=True, exist_ok=True)
             self._input_history = FileHistory(str(history_path))
         else:
@@ -423,14 +427,16 @@ class DevSession:
         engine = self.config.get("engine", "python")
         model = self.config.get("cheap_model", "N/A")
         path = self.config.get("project_path", ".")
-        output = self.config.get("output_path", "./dev_output")
+        output = str(self.files.output_dir)
+        same = (Path(path).resolve() == self.files.output_dir.resolve())
 
         print("\n" + "=" * 60)
         print("🚀 AI 개발 파이프라인 v4")
         print("=" * 60)
         print(f"  도메인   : {engine}")
-        print(f"  프로젝트 : {path}")
-        print(f"  출력     : {output}")
+        print(f"  작업폴더 : {path}")
+        if not same:
+            print(f"  출력폴더 : {output}  (분리됨)")
         print(f"  모델     : {model}")
         print()
         print("  session / 세션종료 → 저장+재시작  |  exit → 종료")
@@ -492,8 +498,14 @@ def _load_config_file() -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description="🚀 AI 개발 파이프라인 v4")
     parser.add_argument("--engine", default=None)
-    parser.add_argument("--path", default=None)
-    parser.add_argument("--save-path", default=None)
+    parser.add_argument(
+        "--path", default=None,
+        help="작업 폴더. PROJECT.md·SESSION_STATE.md도 여기에 읽고 씀 (기본).",
+    )
+    parser.add_argument(
+        "--save-path", default=None,
+        help="PROJECT.md·SESSION_STATE.md·생성 파일을 별도 폴더에 저장하고 싶을 때만 지정.",
+    )
     args = parser.parse_args()
 
     config = DEFAULT_CONFIG.copy()
